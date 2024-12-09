@@ -69,9 +69,6 @@ def get_AES_key():
 def encrypt_AES(data):
     NOT_MY_KEY = get_AES_key()     # NOT_MY_KEY
     iv = os.urandom(16)     # Initialization Vector (16-byte) 
-    if len(iv) != 16:
-        raise ValueError("IV must be 16 bytes long.")
-    
     cipher = Cipher(algorithms.AES(NOT_MY_KEY), modes.CBC(iv), backend=default_backend())
     
     # Pad data
@@ -166,7 +163,7 @@ def get_key(expired=False):
 # User registration
 def register_user(username, email):
     pwd = str(uuid4())
-    pwd_h = PasswordHasher()
+    pwd_h = PasswordHasher(time_cost=2, memory_cost=65536, parallelism=2, hash_len=32,salt_len=16)
     hashed_pwd = pwd_h.hash(pwd)
     
     with db:
@@ -204,14 +201,14 @@ private_pem = serialize_key(private_key)
 expired_pem = serialize_key(expired_key)
    
 # Encrypt serialized keys, and respective IVs
-encrypted_private_key_PEM, IV_V = encrypt_AES(private_pem.decode())
-encrypted_expired_key_PEM, IV_E = encrypt_AES(expired_pem.decode())   
+encrypted_private_key_PEM, IV_V = encrypt_AES(private_pem.decode('utf-8'))
+encrypted_expired_key_PEM, IV_E = encrypt_AES(expired_pem.decode('utf-8'))   
    
 # Store valid key (expiration 1 hour from now)
 store_key(encrypted_private_key_PEM, IV_V, int((datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=1)).timestamp()))  
 
 # Store expired key (expired by 5 hours)
-store_key(encrypted_expired_key_PEM, IV_E, int((datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=1)).timestamp()))    
+store_key(encrypted_expired_key_PEM, IV_E, int((datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=5)).timestamp()))    
 
 # Commit Changes to DB
 db.commit()
@@ -353,7 +350,7 @@ if __name__ == "__main__":
     try:
         webServer.serve_forever()
     except KeyboardInterrupt:
-        #db.execute("""DROP TABLE IF EXISTS keys""") # Only for debugging purposes
+       # db.execute("""DROP TABLE IF EXISTS keys""") # Only for debugging purposes
         db.close()
         pass
 

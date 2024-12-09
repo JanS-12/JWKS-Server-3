@@ -10,12 +10,14 @@ from cryptography.hazmat.backends  import default_backend
 from cryptography.hazmat.primitives.padding import PKCS7
 from cryptography.hazmat.primitives import serialization
 from urllib.parse import urlparse, parse_qs
+from collections import defaultdict
 from argon2 import PasswordHasher
+from uuid import uuid4
 import datetime
 import sqlite3
 import base64
+import time
 import json
-import uuid
 import jwt
 import os
 
@@ -33,6 +35,7 @@ db.execute(
     '''CREATE TABLE IF NOT EXISTS keys(
             kid INTEGER PRIMARY KEY AUTOINCREMENT,
             key BLOB NOT NULL,
+            iv BLOB NOT NULL,
             exp INTEGER NOT NULL)''')
 
 # Create 'users' table
@@ -57,15 +60,18 @@ db.execute(
 
 # Get environment variable
 def get_AES_key():
-    key = os.getenv("NOT_MY_KEY")
+    key = os.getenv('NOT_MY_KEY', 'default_key').encode().ljust(32)[:32]
     if not key:
-        raise ValueError("Environment variabel 'NOT_MY_KEY' is not set")
-    return bytes.fromhex(key)    
+        raise ValueError("Environment variable 'NOT_MY_KEY' is not set")
+    return key    
 
-# AES encrypting function
-def encrypt_AES(data: bytes) -> dict:
+# AES encrypting function (encrypts serialized data)
+def encrypt_AES(data):
     NOT_MY_KEY = get_AES_key()     # NOT_MY_KEY
     iv = os.urandom(16)     # Initialization Vector (16-byte) 
+    if len(iv) != 16:
+        raise ValueError("IV must be 16 bytes long.")
+    
     cipher = Cipher(algorithms.AES(NOT_MY_KEY), modes.CBC(iv), backend=default_backend())
     
     # Pad data
@@ -76,14 +82,11 @@ def encrypt_AES(data: bytes) -> dict:
     encryptor = cipher.encryptor()
     ciphertext = encryptor.update(padded_data) + encryptor.finalize()   
     
-    return {"ciphertext": ciphertext, "iv": iv}
+    return ciphertext, iv
 
-# AES decrypting function
-def decrypt_AES(data: dict) -> bytes:
+# AES decrypting function (decrypts data, returns serialized data)
+def decrypt_AES(ciphertext, iv):
     NOT_MY_KEY = get_AES_key()         # NOT_MY_KEY
-    iv = data["iv"]             # Initialization Vector (16-byte)
-    ciphertext = data["ciphertext"]         # Encrypted Data
-    
     cipher = Cipher(algorithms.AES(NOT_MY_KEY), modes.CBC(iv), backend=default_backend)
     
     # Decrypt ciphertext
@@ -117,49 +120,113 @@ def serialize_key(key):
     
 # Deserialize key from PEM format    
 def deserialize_pem(pem):
-    return serialization.load_pem_private_key(pem, password=None) 
+    return serialization.load_pem_private_key(pem.encode(), password=None) 
    
 # Save the keys to DB
-def store_key(k_pem, exp):
+def store_key(encrypted_key, iv, exp):
     with db:
-        db.execute("INSERT INTO keys (key, exp) VALUES (?, ?)", (k_pem, exp))
+        db.execute("INSERT INTO keys (key, iv, exp) VALUES (?, ?, ?)", 
+            (sqlite3.Binary(encrypted_key), sqlite3.Binary(iv), exp))
         
-# Function to get a key from the database (expired or valid)
-def get_key(expired=False):
-    current_time = int(datetime.datetime.now(datetime.UTC).timestamp)
+def get_kid(expired=False):
+    current_time = int(datetime.datetime.now(datetime.UTC).timestamp())
     
     with db:
         if expired:
-            result = db.execute("SELECT key, exp FROM keys WHERE exp <= ? ORDER BY exp DESC LIMIT 1", (current_time,))
+            result = db.execute("SELECT kid FROM keys WHERE exp <= ? ORDER BY exp DESC LIMIT 1", (current_time,))
         else:
-            result = db.execute("SELECT key, exp FROM keys WHERE exp > ? ORDER BY exp ASC LIMIT 1", (current_time,))
+            result = db.execute("SELECT kid FROM keys WHERE exp > ? ORDER BY exp ASC LIMIT 1", (current_time,))
+        row = result.fetchone()
+    if row:     
+        return row[0]
+    else:
+        print("No kid found")  
+    
+    return None    
+               
+# Function to get a key from the database (expired or valid)
+def get_key(expired=False):
+    current_time = int(datetime.datetime.now(datetime.UTC).timestamp())
+    
+    with db:
+        if expired:
+            result = db.execute("SELECT key, iv FROM keys WHERE exp <= ? ORDER BY exp DESC LIMIT 1", (current_time,))
+        else:
+            result = db.execute("SELECT key, iv FROM keys WHERE exp > ? ORDER BY exp ASC LIMIT 1", (current_time,))
         row = result.fetchone()
         
     if row:             # Return kid with the corresponding private key 
-        return row[0], deserialize_pem(decrypt_AES(row[1]))      
+        encrypted_key, iv = row
+        return decrypt_AES(encrypted_key, iv) 
+    else:
+        print("Key is None")
+         
     return None, None
+
+# User registration
+def register_user(username, email):
+    pwd = str(uuid4())
+    pwd_h = PasswordHasher()
+    hashed_pwd = pwd_h.hash(pwd)
+    
+    with db:
+        db.execute('''
+            INSERT INTO users (username, password_hash, email) VALUES (?, ?, ?)''',
+            (username, hashed_pwd, email))
+        
+    return pwd    
+
+# Log Auth Requests
+def auth_request_log(user_id, request_ip, request_timestamp):
+    with db:
+        db.execute('''
+            INSERT INTO auth_logs (user_id, request_ip, request_timestamp) VALUES (?, ?, ?)''', 
+            (user_id, request_ip, request_timestamp))
+        
+def get_user_id(username):
+    with db:
+        cursor = db.execute('''SELECT id FROM users WHERE username = ?''', (username,))
+        user = cursor.fetchone()
+    
+    if user:
+        return user[0]
+    else:
+        print("User ID not found")
+        
+    return None    
     
 # Re-using given code for key generation
 private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 expired_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
-# Serialize keys
+# Serialize keys to PEM format
 private_pem = serialize_key(private_key)
 expired_pem = serialize_key(expired_key)
    
 # Encrypt serialized keys, and respective IVs
-encrypted_private_key, IV_V = encrypt_AES(private_pem.encode('utf-8'))
-encrypted_expired_key, IV_E = encrypt_AES(expired_pem.encode('utf-8'))   
-
-current_time = int(datetime.datetime.now(datetime.UTC))
+encrypted_private_key_PEM, IV_V = encrypt_AES(private_pem.decode())
+encrypted_expired_key_PEM, IV_E = encrypt_AES(expired_pem.decode())   
    
 # Store valid key (expiration 1 hour from now)
-store_key(encrypted_private_key.decode(), current_time + datetime.timedelta(hours=1).timestamp())  
+store_key(encrypted_private_key_PEM, IV_V, int((datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=1)).timestamp()))  
 
 # Store expired key (expired by 5 hours)
-store_key(encrypted_expired_key.decode(), current_time - datetime.timedelta(hours=5).timestamp())    
+store_key(encrypted_expired_key_PEM, IV_E, int((datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=1)).timestamp()))    
 
+# Commit Changes to DB
 db.commit()
+
+# Rate Limiter
+def rate_limiter(ip_address, request_count, limit=10):
+    current_time = time.time()
+    request_times = request_count[ip_address]
+    request_times =  [t for t in request_times if current_time - t <= 1] # Filter out past timestamps
+    request_count[ip_address] = request_times
+    if len(request_times) >= limit:
+        return False
+    
+    request_count[ip_address].append(current_time)
+    return True
 
 # HTTP Server logic remains unchanged
 class MyServer(BaseHTTPRequestHandler):
@@ -167,6 +234,8 @@ class MyServer(BaseHTTPRequestHandler):
     def not_supported_methods(self):
         self.send_response(404)
         self.end_headers()
+    
+    request_counts = defaultdict(list)
     
     # Simplificaiton for unused methods          
     do_PUT = do_DELETE = do_HEAD = do_PATCH = not_supported_methods
@@ -177,35 +246,70 @@ class MyServer(BaseHTTPRequestHandler):
         params = parse_qs(parsed_path.query)
 
         if parsed_path.path == "/auth":
-            exp = 'expired' in params
-            row = get_key(exp)            
+            ip = self.client_address[0]         # Get IP address
             
-            # For each 'auth' request, log the following into the 'auth_logs' table:
-                # Request IP Address
-                # Timestamp of the request
-                # User ID of the username
+             # Rate Limiter
+            if not rate_limiter(ip, MyServer.request_counts):
+                self.send_response(429)
+                self.end_headers()
+                self.wfile.write(b"The maximum of requests have been reached")
+                return
+            
+            exp = 'expired' in params
+            content_length = int(self.headers['Content-Length'])
+            post_data =  json.loads(self.rfile.read(content_length))
+            username = post_data.get("username")
+            
+            kid = get_kid(exp)              # Retrieves key ID
+            key_pem = get_key(exp)          # Retrieves key PEM
+            decrypted_key = deserialize_pem(key_pem)        # Deserialize key PEM
 
-            if row:
-                k_pem = row[0]      # Index 0 is pem, Index 1 is exp
-                headers = {"kid": "expiredKID" if exp else "goodKID"}
-
+            if decrypted_key:
+                headers = {"kid": str(kid) }
                 token_payload = {
-                    "user": "username",
+                    "user": username,
                     "exp": datetime.datetime.now(datetime.UTC) + (datetime.timedelta(hours=-2) if exp else datetime.timedelta(hours=2))
                 }
 
                 encoded_jwt = jwt.encode(
                     token_payload, 
-                    k_pem.encode(), 
+                    key_pem.encode(), 
                     algorithm = "RS256", 
                     headers = headers)
                 
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(bytes(encoded_jwt, "utf-8"))
+
+                # Log auth request
+                user_id = get_user_id(username)
+                request_ip = self.client_address[0]
+                request_timestamp = datetime.datetime.now(datetime.UTC)
+                auth_request_log(user_id, request_ip, request_timestamp)                
             else:
                 self.not_supported_methods() # Key not found
-        #elif parsed_path.path == "/register":
+                print("No decrypted key")
+              
+        # "./register endpoint"   
+        elif parsed_path.path == "/register":
+            content_length = int(self.headers['Content-Length'])
+            post_data = json.loads(self.rfile.read(content_length))
+
+            username = post_data.get("username")
+            email = post_data.get("email")
+            
+            if username is not None and email is not None:
+                password = register_user(username, email)   # Register user and get pwd
+                self.send_response(201)
+                self.end_headers()
+                self.wfile.write(bytes(json.dumps({"password": password}), 'utf-8'))
+            else: 
+                print("No username nor email")
+        
+        else: 
+            self.send_response(405)
+            self.end_headers()
+            print("Not valid path")    
         return
 
     #GET Request (/.well-known/jwks.json)
@@ -215,21 +319,20 @@ class MyServer(BaseHTTPRequestHandler):
             self.send_header("Content-type", "application/json")
             self.end_headers()
 
-            # Get valid key 
-            valid_key = get_key(False)              
+            # Get decrypted key 
+            key_pem = get_key(False)              
             jwks = {"keys": []}  #Key Set
 
-            if valid_key:
-                k_pem = valid_key[0]
-                key = serialization.load_pem_private_key(k_pem.encode(), password = None)
-
+            if key_pem:
+             #   k_pem = valid_key[0]
+                key = deserialize_pem(key_pem)
                 numbers = key.private_numbers()
                 
                 jwk = {
                     "alg": "RS256",
                     "kty": "RSA",
                     "use": "sig",
-                    "kid": "goodKID",
+                    "kid": "0",
                     "n": int_to_base64(numbers.public_numbers.n),
                     "e": int_to_base64(numbers.public_numbers.e),
                 }
